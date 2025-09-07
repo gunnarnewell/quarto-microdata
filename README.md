@@ -10,10 +10,10 @@ Add Schema.org semantics (or any other semantics you want) to your Quarto sites 
 
 ## Installing
 
-Replace the `<github-organization>` with your GitHub org or username:
+To install this extension in your current directory (or int the Quarto project that you're currently working in), use the following command:
 
 ```bash
-quarto add <github-organization>/quarto-microdata
+quarto add gunnarnewell/quarto-microdata
 ```
 
 This installs the extension under `_extensions/`. If you use version control, commit that directory.

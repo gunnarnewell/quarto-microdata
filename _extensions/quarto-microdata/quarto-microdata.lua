@@ -78,37 +78,68 @@ local function parse_kv(tail)
   return kv
 end
 
--- Opening tokens (must end with '['):
---   <<item:TYPE ...>>[
---   <<prop:NAME>>[
---   <<NAME>>[   (shorthand prop)
+-- Opening tokens (support WITH or WITHOUT the following '[')
+--   <<item:TYPE ...>>[    or   <<item:TYPE ...>>
+--   <<prop:NAME>>[        or   <<prop:NAME>>
+--   <<NAME>>[             or   <<NAME>>
 local function parse_opening_token(text)
   local s = trim(text)
-  s = s:gsub(">>%s+%[", ">>[") -- tolerate space before '['
+  s = s:gsub(">>%s+%[", ">>[") -- normalize any space before '['
 
   -- item
   do
-    local typ, tail = s:match("^<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%[%s*$")
-    if typ then return { kind="item", type=typ, attrs=parse_kv(tail or "") } end
+    local typ, tail = s:match("^<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[%s*$")
+    if typ then return { kind="item", type=typ, attrs=parse_kv(tail or ""), needs_next_bracket=false } end
+    local typ2, tail2 = s:match("^<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*$")
+    if typ2 then return { kind="item", type=typ2, attrs=parse_kv(tail2 or ""), needs_next_bracket=true } end
   end
   -- explicit prop
   do
-    local name = s:match("^<<%s*prop%s*:%s*([%w%._:%-]+)%s*>>%[%s*$")
-    if name then return { kind="prop", name=name } end
+    local name = s:match("^<<%s*prop%s*:%s*([%w%._:%-]+)%s*>>%s*%[%s*$")
+    if name then return { kind="prop", name=name, needs_next_bracket=false } end
+    local name2 = s:match("^<<%s*prop%s*:%s*([%w%._:%-]+)%s*>>%s*$")
+    if name2 then return { kind="prop", name=name2, needs_next_bracket=true } end
   end
   -- shorthand prop
   do
-    local name = s:match("^<<%s*([%w%._:%-]+)%s*>>%[%s*$")
+    local name = s:match("^<<%s*([%w%._:%-]+)%s*>>%s*%[%s*$")
     if name and name ~= "item" and name ~= "prop" then
-      return { kind="prop", name=name, short=true }
+      return { kind="prop", name=name, short=true, needs_next_bracket=false }
+    end
+    local name2 = s:match("^<<%s*([%w%._:%-]+)%s*>>%s*$")
+    if name2 and name2 ~= "item" and name2 ~= "prop" then
+      return { kind="prop", name=name2, short=true, needs_next_bracket=true }
     end
   end
   return nil
 end
 
--- Inline close token is just a lone ']' string node
-local function is_close_token(el)
-  return el.t == "Str" and trim(el.text) == "]"
+-- Recognize a close token ']' either as a whole Str or embedded in a Str.
+local function close_bracket_info(el)
+  if el.t ~= "Str" then return nil end
+  local t = el.text
+  local idx = t:find("%]")
+  if not idx then return nil end
+  -- return pieces: before ']' and after ']'
+  return { before = t:sub(1, idx-1), after = t:sub(idx+1) }
+end
+
+-- If an opener was seen *without* '[', consume a leading '[' from the next Str
+local function consume_leading_bracket(inlines, pos)
+  local nxt = inlines[pos+1]
+  if nxt and nxt.t == "Str" then
+    local t = nxt.text
+    if t:sub(1,1) == "[" then
+      local rest = t:sub(2)
+      if rest ~= "" then
+        inlines[pos+1] = pandoc.Str(rest)
+      else
+        table.remove(inlines, pos+1)
+      end
+      return true
+    end
+  end
+  return false
 end
 
 -- Build attrs for item container (Microdata/RDFa/both), honoring per-item vocab
@@ -145,31 +176,76 @@ local function process_inlines(inlines, i0)
     if el.t == "Str" then
       local open = parse_opening_token(el.text)
       if open then
-        local depth, j = 1, i + 1
-        while j <= #inlines do
-          local e = inlines[j]
-          if e.t == "Str" then
-            local op2 = parse_opening_token(e.text)
-            if op2 then depth = depth + 1
-            elseif is_close_token(e) then depth = depth - 1; if depth == 0 then break end end
-          end
-          j = j + 1
-        end
-        if j > #inlines then
-          table.insert(out, el) -- no close; leave literal
-          i = i + 1
+        -- If the opener didn't include '[', the next token must supply it
+        if open.needs_next_bracket and not consume_leading_bracket(inlines, i) then
+          -- Not actually an opener; emit literally
+          table.insert(out, el); i = i + 1
         else
-          local inner = {}
-          for k = i + 1, j - 1 do table.insert(inner, inlines[k]) end
-          inner = process_inlines(inner, 1)
-          local replaced
-          if open.kind == "prop" then
-            replaced = pandoc.Span(inner, prop_attr(open.name))
-          else
-            replaced = pandoc.Span(inner, item_attr(open.type, open.attrs and open.attrs.prop, open.attrs))
+          -- find matching close with nesting
+          local depth, j = 1, i + 1
+          local before_at_close, after_at_close = nil, nil
+          while j <= #inlines do
+            local e = inlines[j]
+            if e.t == "Str" then
+              local op2 = parse_opening_token(e.text)
+              if op2 then
+                -- if the nested opener requires '[', try to consume it
+                if op2.needs_next_bracket then consume_leading_bracket(inlines, j) end
+                depth = depth + 1
+              else
+                local cinfo = close_bracket_info(e)
+                if cinfo then
+                  depth = depth - 1
+                  if depth == 0 then
+                    before_at_close, after_at_close = cinfo.before, cinfo.after
+                    break
+                  end
+                end
+              end
+            end
+            j = j + 1
           end
-          table.insert(out, replaced)
-          i = j + 1
+
+          if j > #inlines then
+            -- no close; treat literally
+            table.insert(out, el); i = i + 1
+          else
+            -- build inner slice (i+1..j-1) plus possible 'before' from close token
+            local inner = {}
+            for k = i + 1, j - 1 do table.insert(inner, inlines[k]) end
+            if before_at_close and before_at_close ~= "" then
+              table.insert(inner, pandoc.Str(before_at_close))
+            end
+            inner = process_inlines(inner, 1)
+
+            local replaced
+            if open.kind == "prop" then
+              -- HOIST: if exactly one Link/Image, put attributes on it
+              if #inner == 1 and (inner[1].t == "Link" or inner[1].t == "Image") then
+                local el1 = inner[1]
+                local attrs = (el1.attr and el1.attr.attributes) or {}
+                if MODE == "microdata" or MODE == "both" then attrs.itemprop = open.name end
+                if MODE == "rdfa" or MODE == "both" then attrs.property = open.name end
+                el1.attr = pandoc.Attr("", {}, attrs)
+                replaced = el1
+              else
+                replaced = pandoc.Span(inner, prop_attr(open.name))
+              end
+            else
+              replaced = pandoc.Span(inner, item_attr(open.type, open.attrs and open.attrs.prop, open.attrs))
+            end
+
+            -- emit replaced
+            table.insert(out, replaced)
+
+            -- put any trailing text (after ']') back into the stream
+            if after_at_close and after_at_close ~= "" then
+              table.insert(out, pandoc.Str(after_at_close))
+            end
+
+            -- advance i past consumed range
+            i = j + 1
+          end
         end
       else
         table.insert(out, el); i = i + 1
@@ -363,58 +439,51 @@ local function find_top_level_items(blocks)
   return nodes
 end
 
--- Minimal JSON encode
+-- ===== JSON encode (safe, minimal) =====
 local function json_escape(s)
-  s = s:gsub('\', '\\'):gsub('"', '\"'):gsub('','\b'):gsub('','\f')
-  s = s:gsub('
-','\n'):gsub('
-','\r'):gsub('	','\t')
+  -- only escape the essentials to avoid parser quirks
+  s = s:gsub("\\", "\\\\")
+       :gsub('"', '\\"')
+       :gsub("\r", "\\r")
+       :gsub("\n", "\\n")
+       :gsub("\t", "\\t")
   return s
 end
+
 local function is_array(tbl)
-  local n = 0; for k,_ in pairs(tbl) do if type(k) ~= "number" then return false end if k>n then n=k end end
-  for i=1,n do if tbl[i]==nil then return false end end
-  return n>0
-end
-local function to_json(v)
-  local tv = type(v)
-  if tv == "nil" then return "null"
-  elseif tv == "boolean" then return v and "true" or "false"
-  elseif tv == "number" then return tostring(v)
-  elseif tv == "string" then return '"'..json_escape(v)..'"'
-  elseif tv == "table" then
-    if is_array(v) then
-      local parts = {}; for i=1,#v do parts[#parts+1]=to_json(v[i]) end
-      return "["..table.concat(parts, ",").."]"
-    else
-      local parts = {}; for k,val in pairs(v) do parts[#parts+1] = '"'..json_escape(k)..'":'..to_json(val) end
-      return "{"..table.concat(parts, ",").."}"
-    end
-  else return '""' end
+  local n = 0
+  for k,_ in pairs(tbl) do
+    if type(k) ~= "number" then return false end
+    if k > n then n = k end
+  end
+  for i = 1, n do if tbl[i] == nil then return false end end
+  return n > 0
 end
 
-local function merge_context_and_prefixes()
-  -- Build a final @context that includes prefixes when provided.
-  -- Cases:
-  --  • JSONLD_CONTEXT string -> if PREFIXES non-empty, return [JSONLD_CONTEXT, PREFIXES]
-  --  • JSONLD_CONTEXT list   -> if PREFIXES non-empty, append PREFIXES
-  --  • JSONLD_CONTEXT map    -> merge keys from PREFIXES (do not overwrite existing)
-  local ctx = JSONLD_CONTEXT
-  if next(PREFIXES) == nil then return ctx end
-  local t = type(ctx)
-  if t == "string" then
-    return { ctx, PREFIXES }
-  elseif t == "table" then
-    if is_array(ctx) then
-      local arr = {}; for i=1,#ctx do arr[i] = ctx[i] end
-      arr[#arr+1] = PREFIXES; return arr
+local function to_json(v)
+  local tv = type(v)
+  if tv == "nil" then
+    return "null"
+  elseif tv == "boolean" then
+    return v and "true" or "false"
+  elseif tv == "number" then
+    return tostring(v)
+  elseif tv == "string" then
+    return '"' .. json_escape(v) .. '"'
+  elseif tv == "table" then
+    if is_array(v) then
+      local parts = {}
+      for i = 1, #v do parts[#parts+1] = to_json(v[i]) end
+      return "[" .. table.concat(parts, ",") .. "]"
     else
-      -- map
-      for k,v in pairs(PREFIXES) do if ctx[k] == nil then ctx[k] = v end end
-      return ctx
+      local parts = {}
+      for k, val in pairs(v) do
+        parts[#parts+1] = '"' .. json_escape(k) .. '":' .. to_json(val)
+      end
+      return "{" .. table.concat(parts, ",") .. "}"
     end
   else
-    return { PREFIXES }
+    return '""'
   end
 end
 
@@ -432,7 +501,9 @@ local function inject_jsonld(doc, graph)
     if hi.t ~= "MetaList" then
       doc.meta["header-includes"] = pandoc.MetaList({ hi, block })
     else
-      local lst = hi; table.insert(lst, block); doc.meta["header-includes"] = lst
+      local lst = hi
+      table.insert(lst, block)
+      doc.meta["header-includes"] = lst
     end
   end
   return doc

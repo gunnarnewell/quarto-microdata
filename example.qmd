@@ -2,47 +2,46 @@
 title: "Quarto Microdata Demo"
 format: html
 filters:
-
-* quarto-microdata
+ - quarto-microdata
 
 # Extension defaults (you can omit this block if you set it in \_quarto.yml)
 
-schema-brackets:
-syntax: both              # microdata | rdfa | both (default: both)
-jsonld: true              # inject JSON-LD <script>
-vocab: "[https://schema.org/](https://schema.org/)"
-prefixes:
-schema: "[https://schema.org/](https://schema.org/)"
-dc:     "[http://purl.org/dc/terms/](http://purl.org/dc/terms/)"
-context:
-"@vocab": "[https://schema.org/](https://schema.org/)"
-dc: "[http://purl.org/dc/terms/](http://purl.org/dc/terms/)"
+quarto-microdata:
+ syntax: microdata              # microdata | rdfa | both (default: both)
+ jsonld: true             # inject JSON-LD <script>
+ vocab: "[https://schema.org/](https://schema.org/)"
+ prefixes:
+  schema: "[https://schema.org/](https://schema.org/)"
+  dc:     "[http://purl.org/dc/terms/](http://purl.org/dc/terms/)"
+ context:
+  "@vocab": "[https://schema.org/](https://schema.org/)"
+  dc: "[http://purl.org/dc/terms/](http://purl.org/dc/terms/)"
 ---
 
 # Avatar (Movie) — Microdata + RDFa (and JSON-LD)
 
-<[item\:Movie](item:Movie)>\[
+<<item:Movie>>[
 
-# <<name>>\[Avatar]
+# <<name>>[Avatar]
 
-**Director:** <\<item\:Person prop=director>>\[
-<<name>>\[James Cameron] (born <<birthDate>>\[1954-08-16])
+**Director:** <<item:Person prop=director>>[
+<<name>>[James Cameron] (born <<birthDate>>[1954-08-16])
 ]
 
-**Genre:** <<genre>>\[Science fiction]
+**Genre:** <<genre>>[Science fiction]
 
 <!-- If your filter includes the optional "hoist-to-link" tweak, the URL will be used as the property value. -->
 
-<<trailer>>\[[Watch trailer](../movies/avatar-theatrical-trailer.html)]
+<<trailer>>[[Watch trailer](../movies/avatar-theatrical-trailer.html)]
 ]
 
 ---
 
 ## Mixed vocab example (Dublin Core)
 
-<\<item\:dc\:CreativeWork vocab=[http://purl.org/dc/terms/>>\[](http://purl.org/dc/terms/>>[)
-<[dc\:title](dc:title)>\[Avatar — review]
-<[dc\:creator](dc:creator)>\[Fan Reviewer]
+<<item:dc:CreativeWork vocab=[http://purl.org/dc/terms/>>[
+<<dc:title>>[Avatar — review]
+<<dc:creator>>[Fan Reviewer]
 ]
 
 ---
@@ -52,4 +51,5 @@ dc: "[http://purl.org/dc/terms/](http://purl.org/dc/terms/)"
 * Use ISO dates inside date properties (e.g., `<<birthDate>>[1954-08-16]`).
 * Place the `<<item:TYPE>>[` opener alone on a line to wrap multiple blocks; close with a lone `]` on its own line.
 * For URL-valued properties like `trailer`, `url`, `sameAs`, or `image`, consider enabling the optional "hoist-to-link" behavior in the filter so the attribute is applied directly to the `<a>`/`<img>` element.
+
 
