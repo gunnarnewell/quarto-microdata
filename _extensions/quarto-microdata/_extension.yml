@@ -1,0 +1,8 @@
+title: Quarto-microdata
+author: Gunnar Newell
+version: 1.0.0
+quarto-required: ">=1.7.0"
+contributes:
+  filters:
+    - quarto-microdata.lua
+
