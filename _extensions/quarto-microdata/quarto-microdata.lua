@@ -90,6 +90,8 @@ local function parse_opening_token(text)
   do
     local typ, tail = s:match("^<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[%s*$")
     if typ then return { kind="item", type=typ, attrs=parse_kv(tail or ""), needs_next_bracket=false } end
+    local typ3, tail3, rest = s:match("^<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[(.+)$")
+    if typ3 then return { kind="item", type=typ3, attrs=parse_kv(tail3 or ""), needs_next_bracket=false, inline_rest = rest } end
     local typ2, tail2 = s:match("^<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*$")
     if typ2 then return { kind="item", type=typ2, attrs=parse_kv(tail2 or ""), needs_next_bracket=true } end
   end
@@ -97,6 +99,8 @@ local function parse_opening_token(text)
   do
     local name = s:match("^<<%s*prop%s*:%s*([%w%._:%-]+)%s*>>%s*%[%s*$")
     if name then return { kind="prop", name=name, needs_next_bracket=false } end
+    local name3, restp = s:match("^<<%s*prop%s*:%s*([%w%._:%-]+)%s*>>%s*%[(.+)$")
+    if name3 then return { kind="prop", name=name3, needs_next_bracket=false, inline_rest = restp } end
     local name2 = s:match("^<<%s*prop%s*:%s*([%w%._:%-]+)%s*>>%s*$")
     if name2 then return { kind="prop", name=name2, needs_next_bracket=true } end
   end
@@ -105,6 +109,10 @@ local function parse_opening_token(text)
     local name = s:match("^<<%s*([%w%._:%-]+)%s*>>%s*%[%s*$")
     if name and name ~= "item" and name ~= "prop" then
       return { kind="prop", name=name, short=true, needs_next_bracket=false }
+    end
+    local name3, rest3 = s:match("^<<%s*([%w%._:%-]+)%s*>>%s*%[(.+)$")
+    if name3 and name3 ~= "item" and name3 ~= "prop" then
+      return { kind="prop", name=name3, short=true, needs_next_bracket=false, inline_rest = rest3 }
     end
     local name2 = s:match("^<<%s*([%w%._:%-]+)%s*>>%s*$")
     if name2 and name2 ~= "item" and name2 ~= "prop" then
@@ -122,6 +130,13 @@ local function close_bracket_info(el)
   if not idx then return nil end
   -- return pieces: before ']' and after ']'
   return { before = t:sub(1, idx-1), after = t:sub(idx+1) }
+end
+
+-- Recognize a block-level close token: a Para with a single Str "]" (allow whitespace)
+local function is_close_token(str_el)
+  if not str_el or str_el.t ~= "Str" then return false end
+  local txt = trim(str_el.text or "")
+  return txt == "]"
 end
 
 -- If an opener was seen *without* '[', consume a leading '[' from the next Str
@@ -168,14 +183,216 @@ local function prop_attr(name)
   return pandoc.Attr("", {}, kv)
 end
 
+-- Remove a trailing ']' from the end of a paragraph's inline list, if present.
+-- Returns true if a close bracket was removed, and mutates the inline list.
+local function remove_trailing_close_bracket(inlines)
+  for idx = #inlines, 1, -1 do
+    local el = inlines[idx]
+    if el.t == "Str" then
+      local pre, after = el.text:match("^(.-)%](%s*)$")
+      if pre ~= nil then
+        if pre == "" then table.remove(inlines, idx) else inlines[idx] = pandoc.Str(pre) end
+        -- also strip trailing spaces/softbreaks after ']' at paragraph end
+        local j = #inlines
+        while j > 0 do
+          local e2 = inlines[j]
+          if e2.t == "Space" or e2.t == "SoftBreak" then table.remove(inlines, j); j = j - 1 else break end
+        end
+        return true
+      end
+    end
+    if el.t ~= "Space" and el.t ~= "SoftBreak" then break end
+  end
+  return false
+end
+
+-- Fuse Pandoc RawInline HTML splits around our double-angle markers.
+-- Pattern: Str("<"), RawInline(html, "<item:Movie>"), optional Str starting with ">"
+-- becomes: Str("<<item:Movie>>" .. rest)
+local function fuse_html_marker(inlines, i)
+  local el = inlines[i]
+  if not (el and el.t == "Str" and el.text == "<") then return false end
+  local raw = inlines[i+1]
+  if not (raw and raw.t == "RawInline" and (raw.format == "html" or raw.format == "HTML")) then return false end
+  local inner = raw.text and raw.text:match("^<%s*(.-)%s*>$") or nil
+  if not inner or inner == "" then return false end
+  local tail = ""
+  if inlines[i+2] and inlines[i+2].t == "Str" then
+    tail = inlines[i+2].text or ""
+    if tail:sub(1,1) == ">" then tail = tail:sub(2) end
+  end
+  local fused = pandoc.Str("<<" .. inner .. ">>" .. tail)
+  table.remove(inlines, i)      -- remove '<'
+  table.remove(inlines, i)      -- remove RawInline now at i
+  if inlines[i] and inlines[i].t == "Str" then table.remove(inlines, i) end
+  table.insert(inlines, i, fused)
+  return true
+end
+
+-- Merge adjacent Str tokens and also run fuse pass across the line.
+local function normalize_inlines(inlines)
+  local i = 1
+  while i <= #inlines do
+    if inlines[i].t == "Str" then
+      -- try to fuse html marker at this position
+      fuse_html_marker(inlines, i)
+      -- collapse consecutive Str tokens
+      while (i < #inlines) and inlines[i].t == "Str" and inlines[i+1].t == "Str" do
+        local t1 = inlines[i].text or ""
+        local t2 = inlines[i+1].text or ""
+        inlines[i].text = t1 .. t2
+        table.remove(inlines, i+1)
+      end
+    end
+    i = i + 1
+  end
+end
+
 -- Recursively process inline sequences, rewriting <<...>>[ ... ] into spans
 local function process_inlines(inlines, i0)
+  normalize_inlines(inlines)
   local out, i = {}, i0 or 1
   while i <= #inlines do
     local el = inlines[i]
     if el.t == "Str" then
+      -- in case earlier mutations created new adjacency
+      normalize_inlines(inlines)
+      el = inlines[i]
+      -- Special-case RawInline item opener pattern: < + RawInline(<item:...>) + >[
+      if el.text == "<" and inlines[i+1] and inlines[i+1].t == "RawInline" and (inlines[i+1].format == "html" or inlines[i+1].format == "HTML") then
+        local raw = inlines[i+1]
+        local typR, tailR = raw.text:match("^<%s*item%s*:%s*([%w%._:%-]+)(.-)%s*>$")
+        if typR and inlines[i+2] and inlines[i+2].t == "Str" then
+          local rest0 = inlines[i+2].text or ""
+          if rest0:sub(1,1) == ">" then rest0 = rest0:sub(2) end
+          if rest0:sub(1,1) == "[" then rest0 = rest0:sub(2) end
+          local inner = {}
+          if rest0 ~= "" then table.insert(inner, pandoc.Str(rest0)) end
+          local depth, j = 1, i + 3
+          local before_at_close, after_at_close = nil, nil
+          while j <= #inlines do
+            local e = inlines[j]
+            if e.t == "Str" then
+              local op2 = parse_opening_token(e.text)
+              if op2 then
+                depth = depth + 1
+              else
+                local cinfo = close_bracket_info(e)
+                if cinfo then
+                  depth = depth - 1
+                  if depth == 0 then before_at_close, after_at_close = cinfo.before, cinfo.after; break end
+                end
+              end
+            end
+            j = j + 1
+          end
+          if j <= #inlines then
+            for k = i + 3, j - 1 do table.insert(inner, inlines[k]) end
+            if before_at_close and before_at_close ~= "" then table.insert(inner, pandoc.Str(before_at_close)) end
+            inner = process_inlines(inner, 1)
+            local kv = parse_kv(tailR or "")
+            local replaced = pandoc.Span(inner, item_attr(typR, kv and kv.prop, kv))
+            table.insert(out, replaced)
+            if after_at_close and after_at_close ~= "" then
+              local tail = process_inlines({ pandoc.Str(after_at_close) }, 1)
+              for _, t in ipairs(tail) do table.insert(out, t) end
+            end
+            i = j + 1
+            -- continue main loop
+          end
+        end
+      end
+      -- Try standard parse
       local open = parse_opening_token(el.text)
+      if not open then
+        local typX, tailX, restX = el.text:match("^%s*<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[(.*)$")
+        if typX then open = { kind = "item", type = trim(typX), attrs = parse_kv(tailX or ""), needs_next_bracket = false, inline_rest = restX } end
+      end
+      if not open then
+        local typZ, tailZ = el.text:match("^%s*<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[%s*$")
+        if typZ then open = { kind = "item", type = trim(typZ), attrs = parse_kv(tailZ or ""), needs_next_bracket = false } end
+      end
+      if not open then
+        -- Very permissive fallback: any << ... >>[ where inside starts with item:
+        local inside = el.text:match("^%s*<<%s*(.-)%s*>>%s*%[")
+        if inside then
+          local typF, tailF = inside:match("^item%s*:%s*([%w%._:%-]+)(.*)$")
+          if typF then open = { kind = "item", type = trim(typF), attrs = parse_kv(tailF or ""), needs_next_bracket = false } end
+        end
+      end
       if open then
+        -- Inline single-token form: opener + '[' + content + ']' all inside el.text
+        if open.inline_rest then
+          local rest = open.inline_rest
+          local idx = rest:find('%]')
+          local inner = {}
+          local after_text = nil
+          if idx then
+            -- close within same token
+            local inner_text = rest:sub(1, idx-1)
+            after_text = rest:sub(idx+1)
+            if inner_text ~= "" then table.insert(inner, pandoc.Str(inner_text)) end
+          else
+            -- no close yet; seed inner with 'rest' and continue scanning tokens
+            if rest ~= "" then table.insert(inner, pandoc.Str(rest)) end
+            local depth, j = 1, i + 1
+            local before_at_close, after_at_close = nil, nil
+            while j <= #inlines do
+              local e = inlines[j]
+              if e.t == "Str" then
+                local op2 = parse_opening_token(e.text)
+                if op2 then
+                  if op2.needs_next_bracket then consume_leading_bracket(inlines, j) end
+                  depth = depth + 1
+                else
+                  local cinfo = close_bracket_info(e)
+                  if cinfo then
+                    depth = depth - 1
+                    if depth == 0 then
+                      before_at_close, after_at_close = cinfo.before, cinfo.after
+                      break
+                    end
+                  end
+                end
+              end
+              j = j + 1
+            end
+            if j > #inlines then
+              -- give up; treat literally
+              table.insert(out, el); i = i + 1; goto continue_inline
+            else
+              for k = i + 1, j - 1 do table.insert(inner, inlines[k]) end
+              if before_at_close and before_at_close ~= "" then table.insert(inner, pandoc.Str(before_at_close)) end
+              after_text = after_at_close
+              -- advance input cursor past consumed tokens
+              i = j
+            end
+          end
+          -- process the collected inner and emit replacement
+          inner = process_inlines(inner, 1)
+          local replaced
+          if open.kind == "prop" then
+            if #inner == 1 and (inner[1].t == "Link" or inner[1].t == "Image") then
+              local el1 = inner[1]
+              local attrs = (el1.attr and el1.attr.attributes) or {}
+              if MODE == "microdata" or MODE == "both" then attrs.itemprop = open.name end
+              if MODE == "rdfa" or MODE == "both" then attrs.property = open.name end
+              el1.attr = pandoc.Attr("", {}, attrs)
+              replaced = el1
+            else
+              replaced = pandoc.Span(inner, prop_attr(open.name))
+            end
+          else
+            replaced = pandoc.Span(inner, item_attr(open.type, open.attrs and open.attrs.prop, open.attrs))
+          end
+          table.insert(out, replaced)
+          if after_text and after_text ~= "" then
+            local tail = process_inlines({ pandoc.Str(after_text) }, 1)
+            for _, t in ipairs(tail) do table.insert(out, t) end
+          end
+          i = i + 1
+          ::continue_inline::
+        else
         -- If the opener didn't include '[', the next token must supply it
         if open.needs_next_bracket and not consume_leading_bracket(inlines, i) then
           -- Not actually an opener; emit literally
@@ -247,6 +464,7 @@ local function process_inlines(inlines, i0)
             i = j + 1
           end
         end
+        end
       else
         table.insert(out, el); i = i + 1
       end
@@ -260,8 +478,77 @@ end
 
 -- Map inline-bearing blocks through process_inlines
 local function map_block_inlines(b)
+  local function transform_inline_items(inlines)
+    normalize_inlines(inlines)
+    local out, i = {}, 1
+    while i <= #inlines do
+      local el = inlines[i]
+      if el.t == "Str" then
+        local open = parse_opening_token(el.text)
+        if not open then
+          local typ1, tail1 = el.text:match("^%s*<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[%s*$")
+          if typ1 then open = { kind="item", type=trim(typ1), attrs=parse_kv(tail1 or ""), needs_next_bracket=false } end
+        end
+        if not open then
+          local typ2, tail2, rest2 = el.text:match("^%s*<<%s*item%s*:%s*([%w%._:%-]+)(.-)>>%s*%[(.+)$")
+          if typ2 then open = { kind="item", type=trim(typ2), attrs=parse_kv(tail2 or ""), needs_next_bracket=false, inline_rest=rest2 } end
+        end
+        if open and open.kind == "item" then
+          local inner = {}
+          local after_text = nil
+          if open.inline_rest then
+            if open.inline_rest ~= "" then table.insert(inner, pandoc.Str(open.inline_rest)) end
+          end
+          local depth, j = 1, i + 1
+          local before_at_close, after_at_close = nil, nil
+          while j <= #inlines do
+            local e = inlines[j]
+            if e.t == "Str" then
+              local op2 = parse_opening_token(e.text)
+              if op2 then
+                depth = depth + 1
+              else
+                local cinfo = close_bracket_info(e)
+                if cinfo then
+                  depth = depth - 1
+                  if depth == 0 then before_at_close, after_at_close = cinfo.before, cinfo.after; break end
+                end
+              end
+            end
+            j = j + 1
+          end
+          if j <= #inlines then
+            for k = i + 1, j - 1 do table.insert(inner, inlines[k]) end
+            if before_at_close and before_at_close ~= "" then table.insert(inner, pandoc.Str(before_at_close)) end
+            inner = process_inlines(inner, 1)
+            local replaced = pandoc.Span(inner, item_attr(open.type, open.attrs and open.attrs.prop, open.attrs))
+            table.insert(out, replaced)
+            if after_at_close and after_at_close ~= "" then table.insert(out, pandoc.Str(after_at_close)) end
+            i = j + 1
+          else
+            -- No explicit ']' in this paragraph; wrap the remainder of the line
+            for k = i + 1, #inlines do table.insert(inner, inlines[k]) end
+            inner = process_inlines(inner, 1)
+            local replaced = pandoc.Span(inner, item_attr(open.type, open.attrs and open.attrs.prop, open.attrs))
+            table.insert(out, replaced)
+            i = #inlines + 1
+          end
+        else
+          table.insert(out, el); i = i + 1
+        end
+      else
+        if el.content then el.content = transform_inline_items(el.content) end
+        table.insert(out, el); i = i + 1
+      end
+    end
+    return out
+  end
   if b.t == "Para" or b.t == "Plain" or b.t == "Header" then
-    b.content = process_inlines(b.content, 1); return b
+    -- First, rewrite simple props, then inline items, then props again inside new items
+    b.content = process_inlines(b.content, 1)
+    b.content = transform_inline_items(b.content)
+    b.content = process_inlines(b.content, 1)
+    return b
   elseif b.t == "BlockQuote" then
     b.content = pandoc.walk_block(pandoc.BlockQuote(b.content), { Para = map_block_inlines, Plain = map_block_inlines, Header = map_block_inlines }).content; return b
   elseif b.t == "Div" then
@@ -282,33 +569,62 @@ local function fold_block_items(blocks)
   local out, i = {}, 1
   while i <= #blocks do
     local b = blocks[i]
-    local openInfo = nil
-    if b.t == "Para" and #b.content == 1 and b.content[1].t == "Str" then
-      local maybe = parse_opening_token(b.content[1].text)
-      if maybe and maybe.kind == "item" then openInfo = maybe end
+    local opener_type, opener_attrs = nil, nil
+    if b.t == "Para" then
+      -- Normalize opener line: fuse RawInline HTML markers into our DSL token
+      local tmp = {}
+      for _, x in ipairs(b.content) do tmp[#tmp+1] = x end
+      normalize_inlines(tmp)
+      if #tmp == 1 and tmp[1].t == "Str" then
+        local maybe = parse_opening_token(tmp[1].text)
+        if maybe and maybe.kind == "item" and not maybe.inline_rest then
+          opener_type = maybe.type; opener_attrs = maybe.attrs
+        end
+      else
+        local s = pandoc.utils.stringify(pandoc.Inlines(tmp))
+        local typ, tail = s:match("^%s*<<%s*item%s*:%s*([^>%[%s]+)(.-)>>%s*%[%s*$")
+        if typ then opener_type, opener_attrs = trim(typ), parse_kv(tail or '') end
+      end
     end
-    if not openInfo then
+    if not opener_type then
       table.insert(out, map_block_inlines(b)); i = i + 1
     else
       local inner, depth = {}, 1; i = i + 1
       while i <= #blocks do
-        local bb = blocks[i]; local isOpen2, isClose2 = false, false
+        local bb = blocks[i]
+        local is_open, is_close = false, false
         if bb.t == "Para" and #bb.content == 1 and bb.content[1].t == "Str" then
-          local mo = parse_opening_token(bb.content[1].text)
-          if mo and mo.kind == "item" then isOpen2 = true end
-          if is_close_token(bb.content[1]) then isClose2 = true end
+          local s2 = trim(bb.content[1].text)
+          local mo = parse_opening_token(s2)
+          if mo and mo.kind == "item" and not mo.inline_rest then is_open = true end
+          if s2 == ']' then is_close = true end
         end
-        if isOpen2 then depth = depth + 1; table.insert(inner, bb)
-        elseif isClose2 then depth = depth - 1
+        if is_open then
+          depth = depth + 1; table.insert(inner, bb)
+        elseif is_close then
+          depth = depth - 1
           if depth == 0 then
-            local wrapped = {}; for _, ib in ipairs(inner) do table.insert(wrapped, map_block_inlines(ib)) end
-            local div = pandoc.Div(wrapped, item_attr(openInfo.type, openInfo.attrs and openInfo.attrs.prop, openInfo.attrs))
+            local wrapped = {}
+            for _, ib in ipairs(inner) do table.insert(wrapped, map_block_inlines(ib)) end
+            local div = pandoc.Div(wrapped, item_attr(opener_type, opener_attrs and opener_attrs.prop, opener_attrs))
             table.insert(out, div); i = i + 1; goto continue
-          else table.insert(inner, bb) end
-        else table.insert(inner, bb) end
+          else
+            table.insert(inner, bb)
+          end
+        else
+          -- Fallback: treat a paragraph ending with ']' as the closing line
+          if depth == 1 and bb.t == "Para" and remove_trailing_close_bracket(bb.content) then
+            table.insert(inner, bb)
+            local wrapped = {}
+            for _, ib in ipairs(inner) do table.insert(wrapped, map_block_inlines(ib)) end
+            local div = pandoc.Div(wrapped, item_attr(opener_type, opener_attrs and opener_attrs.prop, opener_attrs))
+            table.insert(out, div); i = i + 1; goto continue
+          end
+          table.insert(inner, bb)
+        end
         i = i + 1
       end
-      -- unmatched close: emit literal
+      -- unmatched close; emit literal opener and content
       table.insert(out, map_block_inlines(b)); for _, ib in ipairs(inner) do table.insert(out, map_block_inlines(ib)) end
     end
     ::continue::
@@ -487,8 +803,32 @@ local function to_json(v)
   end
 end
 
+-- Order @graph nodes for readability: put Movie first, then by @type name
+local function order_graph(graph)
+  if not graph or #graph <= 1 then return graph end
+  local function type_label(node)
+    local t = node and node["@type"]
+    if type(t) == "table" then t = t[1] end
+    t = tostring(t or "")
+    return t
+  end
+  local function rank(node)
+    local t = type_label(node)
+    if t == "Movie" or t:match("[:/#]Movie$") then return 0 end
+    return 1
+  end
+  table.sort(graph, function(a, b)
+    local ra, rb = rank(a), rank(b)
+    if ra ~= rb then return ra < rb end
+    local ta, tb = type_label(a), type_label(b)
+    return ta < tb
+  end)
+  return graph
+end
+
 local function inject_jsonld(doc, graph)
   if not graph or #graph == 0 then return doc end
+  graph = order_graph(graph)
   local payload = { ["@context"] = merge_context_and_prefixes(), ["@graph"] = graph }
   local json = to_json(payload)
   local html = '<script type="application/ld+json">' .. json .. '</script>'
@@ -507,6 +847,44 @@ local function inject_jsonld(doc, graph)
     end
   end
   return doc
+end
+
+-- Merge configured JSON-LD context with prefixes and @vocab
+function merge_context_and_prefixes()
+  local hasPrefixes = next(PREFIXES) ~= nil
+  local function build_prefix_map()
+    local m = {}
+    if VOCAB and VOCAB ~= "" then m["@vocab"] = VOCAB end
+    if hasPrefixes then for k, v in pairs(PREFIXES) do m[k] = v end end
+    return m
+  end
+
+  if type(JSONLD_CONTEXT) == "string" or JSONLD_CONTEXT == nil then
+    local base = JSONLD_CONTEXT or "https://schema.org"
+    -- Guard against accidental concatenation of two IRIs
+    if type(base) == "string" and base:match("https?://.+https?://") then base = "https://schema.org" end
+    if hasPrefixes or (VOCAB and VOCAB ~= "") then
+      return { base, build_prefix_map() }
+    else
+      return base
+    end
+  elseif type(JSONLD_CONTEXT) == "table" then
+    -- Distinguish between array-like and map-like tables
+    if is_array(JSONLD_CONTEXT) then
+      local ctx_arr = {}
+      for i = 1, #JSONLD_CONTEXT do ctx_arr[i] = JSONLD_CONTEXT[i] end
+      if hasPrefixes or (VOCAB and VOCAB ~= "") then table.insert(ctx_arr, build_prefix_map()) end
+      return ctx_arr
+    else
+      -- Map-like: merge, but don't overwrite explicit keys
+      local ctx_map = {}
+      for k, v in pairs(JSONLD_CONTEXT) do ctx_map[k] = v end
+      if (VOCAB and VOCAB ~= "") and ctx_map["@vocab"] == nil then ctx_map["@vocab"] = VOCAB end
+      if hasPrefixes then for k, v in pairs(PREFIXES) do if ctx_map[k] == nil then ctx_map[k] = v end end end
+      return ctx_map
+    end
+  end
+  return "https://schema.org"
 end
 
 -- ========================= Meta & main entry =========================
@@ -550,6 +928,22 @@ end
 function Pandoc(doc)
   -- transform bracket DSL into Microdata/RDFa attributes (with per-item vocab)
   doc.blocks = fold_block_items(doc.blocks)
+  -- as a safety net, remove any literal opener/closer lines that slipped through
+  local cleaned = {}
+  for _, b in ipairs(doc.blocks) do
+    local drop = false
+    if b.t == "Para" then
+      local s = pandoc.utils.stringify(pandoc.Inlines(b.content))
+      if s:match("^%s*<<%s*item%s*:%s*[^>]+>>%s*%[%s*$") then drop = true end
+      if s:match("^%s*%]%s*$") then drop = true end
+    end
+    if not drop then table.insert(cleaned, b) end
+  end
+  doc.blocks = cleaned
+  -- final pass: trim any stray trailing ']' at ends of paragraphs
+  for i, b in ipairs(doc.blocks) do
+    if b.t == "Para" then remove_trailing_close_bracket(b.content) end
+  end
   -- auto JSON-LD
   if JSONLD then
     local nodes = find_top_level_items(doc.blocks)
@@ -557,3 +951,7 @@ function Pandoc(doc)
   end
   return doc
 end
+
+
+
+
